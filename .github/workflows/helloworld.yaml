@@ -1,7 +1,14 @@
 name: First workflow
 on:
   push:
-    branches: [main]
+    paths:
+      - '!README.md'
+      - '!docs/**'
+      - '**.js'
+    branches:
+      - 'main'
+      - 'release/**'
+      - '!dev'
 jobs:
   say-hello:
     runs-on: ubuntu-latest
