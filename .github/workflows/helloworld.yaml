@@ -2,9 +2,9 @@ name: First workflow
 on:
   push:
     paths:
-      - '!README.md'
+      - 'README.md'
       - '!docs/**'
-      - '**.js'
+      - '!**.js'
     branches:
       - 'main'
       - 'release/**'
