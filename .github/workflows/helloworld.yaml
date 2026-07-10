@@ -8,3 +8,8 @@ jobs:
     steps:
       - name: Print Hello World
         run: echo Hello World
+      - name: Find the current date
+        run: |
+          echo "TODAY=$(date +%y-%m-%d)" >> ${GITHUB_ENV}
+      - name: Print the current date
+        run: echo Hello World, today is $TODAY
