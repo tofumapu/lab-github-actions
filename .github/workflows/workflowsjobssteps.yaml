@@ -38,4 +38,4 @@ jobs:
       - jobs-2
       - jobs-3
     steps:
-      - echo "Workflows from a Directed Acyclic Graph (DAG)"
+      - run: echo "Workflows from a Directed Acyclic Graph (DAG)"
