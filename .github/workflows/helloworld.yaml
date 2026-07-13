@@ -13,7 +13,7 @@ on:
   pull_request:
     branches:
       - 'main'
-    types: [opened, reopened, synchronized, labeled, unlabeled]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
   workflow_dispatch:
 jobs:
   say-hello:
