@@ -1,5 +1,14 @@
 name: First workflow
 on:
+  pull_request:
+    branches:
+      - 'main'
+    types:
+      - opened
+      - labeled
+      - reopened
+      - unlabeled
+      - synchronize
   push:
     paths:
       - 'README.md'
@@ -10,10 +19,6 @@ on:
       - 'main'
       - 'release/**'
       - '!dev'
-  pull_request:
-    branches:
-      - 'main'
-    types: [opened, reopened, synchronize, labeled, unlabeled]
   workflow_dispatch:
 jobs:
   say-hello:
