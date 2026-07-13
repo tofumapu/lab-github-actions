@@ -2,17 +2,16 @@ name: coverage
 on: 
   pull_request_target:
     branches:
-      - 'main'
-      - 'master'
-    type: [opened, reopened, synchronize]
+      - main
+      - master
+    types: [opened, reopened, synchronize]
   push:
     paths:
       - 'README.md'
-      - '**.yaml'
-      - '!docs/**'
+      - '.github/workflows/coverage.yaml'
       - '**.js'
     branches:
-      - 'main'
+      - main
       - 'release/**'
       - '!dev'
   workflow_dispatch:
@@ -24,7 +23,10 @@ jobs:
       pull-requests: write
       contents: read
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
       - run: npm install
       - run: npm run test:coverage
       - uses: codecov/codecov-action@v5
