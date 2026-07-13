@@ -1,0 +1,14 @@
+{
+  "name": "simple-js-test-coverage",
+  "version": "1.0.0",
+  "description": "Simple JS application with unit tests and coverage",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "jest",
+    "test:coverage": "jest --coverage"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}

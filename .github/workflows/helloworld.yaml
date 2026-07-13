@@ -1,13 +1,9 @@
 name: First workflow
 on:
   pull_request:
-    branches:
-      - 'main'
-    types:
+    type:
       - opened
-      - labeled
       - reopened
-      - unlabeled
       - synchronize
   push:
     paths:
