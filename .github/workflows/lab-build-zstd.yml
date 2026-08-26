@@ -186,9 +186,6 @@ jobs:
 
       # Deploy + wait, timed as ONE block — same methodology as the legacy lab job, so the two
       # numbers are directly comparable. platform-version pinned to 1.4+ (required for zstd/SOCI).
-      # deployment-configuration min=0/max=200 cho phép ECS dừng task cũ + khởi động task mới
-      # CÙNG LÚC (thay vì mặc định min=100 bắt phải chờ task mới healthy rồi mới dừng task cũ) —
-      # chỉ hợp lý cho lab test (chấp nhận downtime ngắn), KHÔNG dùng cho production có traffic thật.
       - name: "🚀 Deploy ECS service and measure time-to-stable"
         run: |
           START=$(date +%s)
@@ -200,7 +197,6 @@ jobs:
             --task-definition "$TASK_DEF_ARN" \
             --desired-count 1 \
             --platform-version "1.4.0" \
-            --deployment-configuration "minimumHealthyPercent=0,maximumPercent=200" \
             --no-cli-pager
 
           aws ecs wait services-stable \
