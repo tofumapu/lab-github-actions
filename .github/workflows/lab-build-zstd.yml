@@ -1,18 +1,19 @@
 #########################################################################
 # Lab: ECS Fargate deploy image compression benchmark                   #
 # A/B test — arm "zstd": buildx build, layer nén zstd (compression-level 3) #
-# Chạy song song với lab-build-legacy-gzip.yml (cùng cluster/service) để so: #
+# Chạy song song với lab-build-legacy-gzip.yml (cùng cluster, service RIÊNG) để so: #
 #   1) thời gian build+push image lên ECR                               #
 #   2) thời gian ECS Fargate task PENDING → STABLE (pull + unpack)       #
 #                                                                         #
-# Yêu cầu chuẩn bị trước (repo Settings → Secrets and variables):        #
-#   secrets.AWS_ROLE_ARN     - IAM role có trust policy cho GitHub OIDC  #
-#   vars.AWS_REGION          - vd "ap-southeast-1"                      #
-#   vars.ECR_REPOSITORY_NAME - tên ECR repository đã tạo sẵn             #
-#   vars.ECS_CLUSTER_NAME    - tên ECS cluster (Fargate)                 #
-#   vars.ECS_SERVICE_NAME    - tên ECS service, task family = ecs-lab-perf-test #
+# Yêu cầu chuẩn bị trước (repo Settings → Secrets and variables → Actions): #
+#   secrets.AWS_ACCESS_KEY_ID     - access key của IAM User (vd tofu)    #
+#   secrets.AWS_SECRET_ACCESS_KEY - secret key tương ứng                 #
+# Các giá trị môi trường khác (region, ECR/ECS name) đã set cứng ở khối  #
+# `env:` bên dưới — sửa trực tiếp trong file này nếu đổi tài nguyên lab. #
 # Yêu cầu: Fargate Platform Version 1.4+ (containerd) để runtime nhận    #
 # diện layer zstd — xem W:\ecs-research\ecs-fargate-deploy-optimization.html #
+# Lưu ý: IAM User dùng access key dài hạn — chỉ hợp lý cho lab cá nhân,  #
+# KHÔNG khuyến nghị cho production (nên dùng OIDC role-based auth).      #
 #########################################################################
 
 name: "[🧪] LAB - ECS Image Perf Test (zstd compression build)"
@@ -20,11 +21,11 @@ name: "[🧪] LAB - ECS Image Perf Test (zstd compression build)"
 on:
   workflow_dispatch:
 
-# Bắt buộc cho OIDC (aws-actions/configure-aws-credentials) — thay cho custom
-# assume-role action + external-id chỉ dùng nội bộ trước đây.
-permissions:
-  id-token: write
-  contents: read
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY_NAME: lab/lab-ecs
+  ECS_CLUSTER_NAME: labtest
+  ECS_SERVICE_NAME: ecs-lab-perf-test-zstd
 
 jobs:
   Build:
@@ -38,12 +39,13 @@ jobs:
       - name: "📥 Checkout repo"
         uses: actions/checkout@v4
 
-      # Assume AWS role via GitHub OIDC — không cần lưu access key dài hạn trong secrets.
+      # Auth bằng access key của IAM User (lab cá nhân) — không dùng OIDC/role-assumption.
       - name: "🔐 Configure AWS credentials"
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       # Login to ECR — action này tự docker login, không cần gọi thủ công.
       - name: "🔑 Login to Amazon ECR"
@@ -54,7 +56,7 @@ jobs:
       - name: "🧭 Resolve lab image URI"
         id: vars
         run: |
-          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY_NAME }}:lab-zstd-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_NAME }}:lab-zstd-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       # GitHub-hosted runner có disk nhỏ hơn self-hosted runner nội bộ — image lab ~3.4GB nên
       # dọn bớt tool cài sẵn (dotnet/android/haskell) để chắc chắn còn đủ chỗ build+push.
@@ -93,9 +95,9 @@ jobs:
       - name: "📏 Report image size in ECR"
         run: |
           aws ecr describe-images \
-            --repository-name "${{ vars.ECR_REPOSITORY_NAME }}" \
+            --repository-name "${{ env.ECR_REPOSITORY_NAME }}" \
             --image-ids imageTag="lab-zstd-${{ github.run_number }}" \
-            --region "${{ vars.AWS_REGION }}" \
+            --region "${{ env.AWS_REGION }}" \
             --query 'imageDetails[0].imageSizeInBytes' \
             --no-cli-pager
 
@@ -108,28 +110,29 @@ jobs:
       - name: "📥 Checkout repo"
         uses: actions/checkout@v4
 
-      # Assume AWS role in deploy job too — each job runs on a fresh runner with isolated credentials.
+      # Auth bằng access key của IAM User — mỗi job chạy trên runner riêng nên phải cấu hình lại.
       - name: "🔐 Configure AWS credentials"
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       # Update task definition JSON so ECS deploys the newly pushed lab image.
       - name: "🧩 Update task definition image"
         working-directory: ./ecs
         run: |
           echo "Current Task Definition"
-          cat "ecs-lab-perf-test.json"
+          cat "ecs-lab-perf-test-zstd.json"
 
           jq --arg IMAGE "${{ needs.Build.outputs.IMAGE_URI }}" \
-             --arg NAME "ecs-lab-perf-test" \
+             --arg NAME "ecs-lab-perf-test-zstd" \
           '.containerDefinitions |= map(
             if .name == $NAME
             then .image = $IMAGE
             else .
             end
-          )' "ecs-lab-perf-test.json" > new-task-def.json
+          )' "ecs-lab-perf-test-zstd.json" > new-task-def.json
 
           echo "New Task Definition"
           cat new-task-def.json
@@ -141,7 +144,7 @@ jobs:
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://new-task-def.json \
             --query 'taskDefinition.taskDefinitionArn' \
-            --region "${{ vars.AWS_REGION }}" \
+            --region "${{ env.AWS_REGION }}" \
             --output text \
             --no-cli-pager)
 
@@ -155,18 +158,18 @@ jobs:
           START=$(date +%s)
 
           aws ecs update-service \
-            --cluster "${{ vars.ECS_CLUSTER_NAME }}" \
-            --service "${{ vars.ECS_SERVICE_NAME }}" \
-            --region "${{ vars.AWS_REGION }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --service "${{ env.ECS_SERVICE_NAME }}" \
+            --region "${{ env.AWS_REGION }}" \
             --task-definition "$TASK_DEF_ARN" \
             --desired-count 1 \
             --platform-version "1.4.0" \
             --no-cli-pager
 
           aws ecs wait services-stable \
-            --cluster "${{ vars.ECS_CLUSTER_NAME }}" \
-            --region "${{ vars.AWS_REGION }}" \
-            --service "${{ vars.ECS_SERVICE_NAME }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --service "${{ env.ECS_SERVICE_NAME }}" \
             --no-cli-pager
 
           END=$(date +%s)
