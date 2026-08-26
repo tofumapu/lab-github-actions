@@ -33,6 +33,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       IMAGE_URI: ${{ steps.vars.outputs.IMAGE_URI }}
+      LATEST_URI: ${{ steps.vars.outputs.LATEST_URI }}
       BUILD_PUSH_SECONDS: ${{ steps.build_push.outputs.BUILD_PUSH_SECONDS }}
     steps:
       # Checkout repo so the lab Dockerfile and task definition are available.
@@ -53,10 +54,13 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       # Resolve the lab image URI for this run — "zstd" suffix keeps it separate from the legacy run.
+      # Tag số theo run_number là bất biến (lịch sử từng lần chạy); LATEST_URI là con trỏ nổi,
+      # luôn được ghi đè để trỏ tới bản build gần nhất của arm này — tiện tham chiếu nhanh.
       - name: "🧭 Resolve lab image URI"
         id: vars
         run: |
           echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_NAME }}:lab-zstd-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "LATEST_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_NAME }}:lab-zstd-latest" >> "$GITHUB_OUTPUT"
 
       # GitHub-hosted runner có disk nhỏ hơn self-hosted runner nội bộ — image lab ~3.4GB nên
       # dọn bớt tool cài sẵn (dotnet/android/haskell) để chắc chắn còn đủ chỗ build+push.
@@ -84,6 +88,7 @@ jobs:
             --platform linux/amd64 \
             --file Dockerfile \
             --tag "${{ steps.vars.outputs.IMAGE_URI }}" \
+            --tag "${{ steps.vars.outputs.LATEST_URI }}" \
             --output type=image,push=true,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true \
             --provenance=false --sbom=false .
 
@@ -262,7 +267,8 @@ jobs:
             echo ""
             echo "| Metric | Value |"
             echo "| --- | --- |"
-            echo "| Image URI | \`${{ needs.Build.outputs.IMAGE_URI }}\` |"
+            echo "| Image URI (tag theo run, bất biến) | \`${{ needs.Build.outputs.IMAGE_URI }}\` |"
+            echo "| Latest tag (con trỏ nổi) | \`${{ needs.Build.outputs.LATEST_URI }}\` |"
             echo "| Build+push duration | ${{ needs.Build.outputs.BUILD_PUSH_SECONDS }}s |"
             echo "| Deploy → stable duration (wall-clock, gồm rollout+drain+polling) | ${DEPLOY_STABLE_SECONDS}s |"
             echo "| Pull start → stop duration (chuẩn, từ ECS agent) | ${PULL_DURATION_SECONDS}s |"
