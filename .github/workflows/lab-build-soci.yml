@@ -84,9 +84,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
           docker system prune -af || true
 
-      # Build với classic builder (gzip mặc định) — giống hệt arm legacy, để phần "chi phí SOCI
-      # thêm vào" chỉ nằm ở bước convert bên dưới, không lẫn vào khác biệt cách build.
-      - name: "🐳 Build and push base image (legacy builder, gzip) — timed"
+      # Build LOCAL THÔI — không push lên ECR. Trước đây có push base rồi skopeo tải lại từ ECR,
+      # tốn 2 lần truyền mạng 4.45GB hoàn toàn không cần thiết (image đã sẵn trong Docker local
+      # ngay sau build). Bước convert bên dưới đọc thẳng từ Docker daemon (docker-daemon:), không
+      # qua mạng — nhanh hơn đáng kể, đặc biệt với image to.
+      - name: "🐳 Build base image (legacy builder, gzip, local only) — timed"
         id: build_push
         working-directory: ./lab
         run: |
@@ -96,21 +98,10 @@ jobs:
             -f Dockerfile \
             -t "${{ steps.vars.outputs.BASE_URI }}" \
             .
-          docker push "${{ steps.vars.outputs.BASE_URI }}"
 
           END=$(date +%s)
           echo "BUILD_PUSH_SECONDS=$((END - START))" >> "$GITHUB_OUTPUT"
-          echo "📦 Base build+push duration: $((END - START))s"
-
-      # Giải phóng Docker-side footprint của base image NGAY sau khi push xong — bước convert
-      # bên dưới tự pull lại độc lập qua skopeo (không cần Docker giữ bản local nữa). Image 4.45GB
-      # unpacked trong Docker (~6-10GB) + base.tar (~4.45GB) + soci.tar (~4.45GB) tồn tại cùng lúc
-      # nếu không dọn ở đây sẽ dễ tràn disk runner (~19-21GB đỉnh) — dọn ở cuối job là quá trễ.
-      - name: "🧹 Free Docker cache after base push"
-        run: |
-          docker rmi "${{ steps.vars.outputs.BASE_URI }}" || true
-          docker system prune -af || true
-          df -h / || true
+          echo "📦 Base build duration (local, không push): $((END - START))s"
 
       # Cài skopeo (copy image giữa registry ⇄ OCI layout trên đĩa), soci CLI, và oras CLI
       # (dùng để query OCI Referrers API — xác minh SOCI index có thật sự gắn vào image không).
@@ -152,21 +143,27 @@ jobs:
           aws ecr get-login-password --region "${{ env.AWS_REGION }}" | \
             oras login --username AWS --password-stdin "${{ steps.login-ecr.outputs.registry }}"
 
-      # Bước cốt lõi của arm này: kéo base image xuống dạng OCI layout (skopeo), convert sang
-      # SOCI Index Manifest v2 bằng --standalone (không cần containerd), rồi đẩy image đã có
-      # SOCI index lên ECR với tag riêng. Layer ảnh hưởng dùng chung với base image (soci convert
-      # chỉ thêm vài KB metadata), nên phần thời gian đo ở đây chính là "chi phí SOCI thêm vào
-      # pipeline" so với 2 arm kia.
+      # Bước cốt lõi của arm này: lấy base image dạng OCI layout TRỰC TIẾP từ Docker daemon local
+      # (docker-daemon:, không qua ECR/mạng), convert sang SOCI Index Manifest v2 bằng --standalone
+      # (không cần containerd), rồi đẩy image đã có SOCI index lên ECR với tag riêng. Layer ảnh
+      # hưởng dùng chung với base image (soci convert chỉ thêm vài KB metadata), nên phần thời
+      # gian đo ở đây chính là "chi phí SOCI thêm vào pipeline" so với 2 arm kia.
       # Mỗi bước có log mốc thời gian riêng — với image vài GB, `soci convert` (CPU-bound) và
-      # `skopeo copy` (network-bound) có thể mất vài phút KHÔNG in thêm dòng log nào, dễ nhìn
-      # nhầm là bị treo. Có mốc rõ ràng để biết đang ở bước nào trước khi quyết định cancel.
+      # `skopeo copy` lên ECR ở bước [3/4] (network-bound) có thể mất vài phút KHÔNG in thêm dòng
+      # log nào, dễ nhìn nhầm là bị treo. Có mốc rõ ràng để biết đang ở bước nào trước khi cancel.
       - name: "🧬 Convert to SOCI-enabled image (standalone) — timed"
         id: soci_convert
         run: |
           START=$(date +%s)
 
-          echo "▶️ [1/4] $(date +%T) skopeo copy base image → OCI archive (network)"
-          skopeo copy "docker://${{ steps.vars.outputs.BASE_URI }}" oci-archive:base.tar
+          echo "▶️ [1/4] $(date +%T) skopeo copy từ Docker daemon local → OCI archive (đĩa, không qua mạng)"
+          skopeo copy "docker-daemon:${{ steps.vars.outputs.BASE_URI }}" oci-archive:base.tar
+
+          # Giải phóng Docker-side footprint NGAY sau khi skopeo đã đọc xong — không cần Docker
+          # giữ bản local nữa. base.tar (4.45GB) + soci.tar (4.45GB) sắp tồn tại song song, dọn
+          # ở đây tránh tràn disk runner thay vì để tới cuối job mới dọn (quá trễ, đỉnh disk đã qua).
+          docker rmi "${{ steps.vars.outputs.BASE_URI }}" || true
+          docker system prune -af || true
 
           echo "▶️ [2/4] $(date +%T) soci convert --standalone (CPU-bound — image càng to càng lâu, có thể vài phút, KHÔNG in log giữa chừng)"
           soci convert --standalone base.tar soci.tar
@@ -207,27 +204,12 @@ jobs:
           echo "SOCI_CONVERT_SECONDS=$((END - START))" >> "$GITHUB_OUTPUT"
           echo "🧬 SOCI convert+push duration: $((END - START))s"
 
-      # Base image chỉ là bước trung gian để feed vào soci convert — hết tác dụng ngay khi
-      # image cuối (đã có SOCI index) push xong. Không xoá thì mỗi lần chạy tốn 2 slot trong
-      # lifecycle policy "giữ 10 image lab-soci*" (base + final cùng prefix), khiến giới hạn
-      # thực tế chỉ còn ~5 lần chạy thay vì 10 như 2 arm kia. batch-delete-image xoá tag DUY
-      # NHẤT trên digest này → ECR xoá luôn cả image, không để lại rác "untagged" nào.
-      # if: always() để dọn cả khi convert phía trên lỡ fail giữa chừng.
-      - name: "🧹 Delete intermediate base tag from ECR"
-        if: always()
-        run: |
-          aws ecr batch-delete-image \
-            --region "${{ env.AWS_REGION }}" \
-            --repository-name "${{ env.ECR_REPOSITORY_NAME }}" \
-            --image-ids imageTag="lab-soci-base-${{ github.run_number }}" \
-            --query 'imageIds' --output table || true
-
-      # Dọn file tạm + local image để giải phóng disk runner.
+      # Base image giờ chỉ là tag LOCAL (build ở bước đầu, không push lên ECR, đã rmi ngay trong
+      # bước convert ở trên) — không còn "lab-soci-base-*" nào tồn tại trên ECR để phải dọn nữa.
+      # Chỉ còn rác là 2 file tar tạm trên đĩa runner.
       - name: "🧹 Clean up local files"
         if: always()
-        run: |
-          rm -f base.tar soci.tar
-          docker rmi "${{ steps.vars.outputs.BASE_URI }}" || true
+        run: rm -f base.tar soci.tar
 
       # Report the compressed size actually stored in ECR — so sánh với size của legacy/zstd.
       # SOCI-enabled image chia sẻ layer với base nên size KHÔNG tăng đáng kể — chỉ thêm ít KB
@@ -255,7 +237,7 @@ jobs:
             echo "| Field | Value |"
             echo "| --- | --- |"
             echo "| Manifest media type | \`$MEDIA_TYPE\` |"
-            echo "| Base image (không có SOCI index) | \`${{ steps.vars.outputs.BASE_URI }}\` |"
+            echo "| Base image tag (chỉ local, không tồn tại trên ECR) | \`${{ steps.vars.outputs.BASE_URI }}\` |"
             echo "| SOCI-enabled image (deploy bằng cái này) | \`${{ steps.vars.outputs.IMAGE_URI }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
