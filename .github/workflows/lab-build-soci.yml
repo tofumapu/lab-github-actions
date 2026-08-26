@@ -102,6 +102,16 @@ jobs:
           echo "BUILD_PUSH_SECONDS=$((END - START))" >> "$GITHUB_OUTPUT"
           echo "📦 Base build+push duration: $((END - START))s"
 
+      # Giải phóng Docker-side footprint của base image NGAY sau khi push xong — bước convert
+      # bên dưới tự pull lại độc lập qua skopeo (không cần Docker giữ bản local nữa). Image 4.45GB
+      # unpacked trong Docker (~6-10GB) + base.tar (~4.45GB) + soci.tar (~4.45GB) tồn tại cùng lúc
+      # nếu không dọn ở đây sẽ dễ tràn disk runner (~19-21GB đỉnh) — dọn ở cuối job là quá trễ.
+      - name: "🧹 Free Docker cache after base push"
+        run: |
+          docker rmi "${{ steps.vars.outputs.BASE_URI }}" || true
+          docker system prune -af || true
+          df -h / || true
+
       # Cài skopeo (copy image giữa registry ⇄ OCI layout trên đĩa), soci CLI, và oras CLI
       # (dùng để query OCI Referrers API — xác minh SOCI index có thật sự gắn vào image không).
       # Cả 3 đều không cần containerd/daemon, phù hợp GitHub-hosted runner.
@@ -141,6 +151,13 @@ jobs:
 
           skopeo copy "docker://${{ steps.vars.outputs.BASE_URI }}" oci-archive:base.tar
           soci convert --standalone base.tar soci.tar
+
+          # Đỉnh disk của cả job nằm ở đây (base.tar + soci.tar tồn tại song song) — log ra để
+          # dễ debug nếu job fail vì hết disk trên image lớn.
+          echo "--- Disk usage at peak (base.tar + soci.tar both present) ---"
+          df -h / || true
+          ls -lh base.tar soci.tar || true
+
           skopeo copy --all oci-archive:soci.tar "docker://${{ steps.vars.outputs.IMAGE_URI }}"
           skopeo copy --all oci-archive:soci.tar "docker://${{ steps.vars.outputs.LATEST_URI }}"
 
