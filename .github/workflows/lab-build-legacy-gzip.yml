@@ -98,6 +98,33 @@ jobs:
             --query 'imageDetails[0].imageSizeInBytes' \
             --no-cli-pager
 
+      # Đọc thẳng manifest trên registry — cho biết chính xác bao nhiêu layer, media type
+      # (tar.gzip vs tar+zstd) và size nén của TỪNG layer, không chỉ tổng số như bước trên.
+      - name: "🖼️ Inspect image layers (media type + size per layer)"
+        run: |
+          docker buildx imagetools inspect "${{ steps.vars.outputs.IMAGE_URI }}" --raw > manifest.json
+
+          LAYER_COUNT=$(jq '.layers | length' manifest.json)
+          TOTAL_BYTES=$(jq '[.layers[].size] | add' manifest.json)
+          TOTAL_MB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_BYTES/1024/1024}")
+
+          {
+            echo ""
+            echo "### 🖼️ Image layer breakdown — Legacy gzip build"
+            echo ""
+            echo "| # | Media type | Size |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          jq -r '.layers | to_entries[] | "\(.key+1)|\(.value.mediaType)|\(.value.size)"' manifest.json | \
+          while IFS='|' read -r idx mtype size; do
+            size_mb=$(awk "BEGIN {printf \"%.1f\", $size/1024/1024}")
+            echo "| $idx | \`$mtype\` | ${size_mb} MB |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tổng: $LAYER_COUNT layer, ${TOTAL_MB} MB (nén, đúng dung lượng lưu trong ECR)**" >> "$GITHUB_STEP_SUMMARY"
+
   Deploy:
     needs: [Build]
     runs-on: ubuntu-latest
@@ -174,15 +201,67 @@ jobs:
           echo "DEPLOY_STABLE_SECONDS=$((END - START))" >> "$GITHUB_ENV"
           echo "⏱️ Time to stable: $((END - START))s"
 
+      # aws ecs wait chỉ poll mỗi 15s (nhiễu ±15s) và đo CẢ rollout/drain task cũ, không chỉ pull.
+      # Timestamp dưới đây do chính ECS agent ghi lại — tách riêng đúng giai đoạn pull+unpack,
+      # là con số tương ứng trực tiếp với benchmark zstd/SOCI của AWS (không lẫn overhead khác).
+      - name: "📊 Fetch ECS task timeline breakdown"
+        run: |
+          TASK_ARN=$(aws ecs list-tasks \
+            --region "${{ env.AWS_REGION }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --service-name "${{ env.ECS_SERVICE_NAME }}" \
+            --query 'taskArns[0]' --output text)
+
+          read -r CREATED CONN PULL_START PULL_STOP STARTED <<< "$(aws ecs describe-tasks \
+            --region "${{ env.AWS_REGION }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].[createdAt,connectivityAt,pullStartedAt,pullStoppedAt,startedAt]' \
+            --output text)"
+
+          to_epoch() { date -d "$1" +%s.%N; }
+
+          T_CREATED=$(to_epoch "$CREATED")
+          T_CONN=$(to_epoch "$CONN")
+          T_PULL_START=$(to_epoch "$PULL_START")
+          T_PULL_STOP=$(to_epoch "$PULL_STOP")
+          T_STARTED=$(to_epoch "$STARTED")
+
+          NETWORK_SETUP=$(awk "BEGIN {printf \"%.1f\", $T_CONN - $T_CREATED}")
+          AGENT_INIT=$(awk "BEGIN {printf \"%.1f\", $T_PULL_START - $T_CONN}")
+          PULL_DURATION=$(awk "BEGIN {printf \"%.1f\", $T_PULL_STOP - $T_PULL_START}")
+          CONTAINER_INIT=$(awk "BEGIN {printf \"%.1f\", $T_STARTED - $T_PULL_STOP}")
+          TOTAL_LAUNCH=$(awk "BEGIN {printf \"%.1f\", $T_STARTED - $T_CREATED}")
+
+          echo "PULL_DURATION_SECONDS=$PULL_DURATION" >> "$GITHUB_ENV"
+          echo "TOTAL_LAUNCH_SECONDS=$TOTAL_LAUNCH" >> "$GITHUB_ENV"
+
+          {
+            echo ""
+            echo "### ⏱️ ECS task timeline breakdown — Legacy gzip build"
+            echo "_(timestamp từ ECS agent, không qua wait-polling)_"
+            echo ""
+            echo "| Giai đoạn | Thời gian |"
+            echo "| --- | --- |"
+            echo "| Created → Connectivity (ENI attach) | ${NETWORK_SETUP}s |"
+            echo "| Connectivity → Pull start (agent init) | ${AGENT_INIT}s |"
+            echo "| **Pull start → Pull stop (kéo + giải nén image)** | **${PULL_DURATION}s** |"
+            echo "| Pull stop → Started (container init) | ${CONTAINER_INIT}s |"
+            echo "| **Tổng Created → Started (task launch thật)** | **${TOTAL_LAUNCH}s** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Write a step summary so this run is easy to compare against the zstd lab run.
       - name: "🧾 Report lab result"
         run: |
           {
+            echo ""
             echo "### 🧪 Lab result — Legacy gzip build"
             echo ""
             echo "| Metric | Value |"
             echo "| --- | --- |"
             echo "| Image URI | \`${{ needs.Build.outputs.IMAGE_URI }}\` |"
             echo "| Build+push duration | ${{ needs.Build.outputs.BUILD_PUSH_SECONDS }}s |"
-            echo "| Deploy → stable duration | ${DEPLOY_STABLE_SECONDS}s |"
+            echo "| Deploy → stable duration (wall-clock, gồm rollout+drain+polling) | ${DEPLOY_STABLE_SECONDS}s |"
+            echo "| Pull start → stop duration (chuẩn, từ ECS agent) | ${PULL_DURATION_SECONDS}s |"
+            echo "| Task launch total (Created → Started) | ${TOTAL_LAUNCH_SECONDS}s |"
           } >> "$GITHUB_STEP_SUMMARY"
