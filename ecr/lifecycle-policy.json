@@ -24,6 +24,17 @@
     },
     {
       "rulePriority": 3,
+      "description": "Keep only the most recent 10 lab-soci images (tag + latest alias share 1 digest, counted once)",
+      "selection": {
+        "tagStatus": "tagged",
+        "tagPrefixList": ["lab-soci"],
+        "countType": "imageCountMoreThan",
+        "countNumber": 10
+      },
+      "action": { "type": "expire" }
+    },
+    {
+      "rulePriority": 4,
       "description": "Clean up any untagged/dangling image immediately (manifest with no tag left)",
       "selection": {
         "tagStatus": "untagged",

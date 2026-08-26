@@ -1,0 +1,368 @@
+#########################################################################
+# Lab: ECS Fargate deploy image compression benchmark                   #
+# A/B test — arm "soci": build gzip cổ điển (giống arm legacy) rồi dùng  #
+# `soci convert --standalone` để đóng gói SOCI index vào image (SOCI    #
+# Index Manifest v2) — image gốc không đổi, chỉ thêm 1 image mới có     #
+# index đi kèm để Fargate lazy-load layer thay vì pull hết rồi mới chạy. #
+# Chạy song song với lab-build-legacy-gzip.yml / lab-build-zstd.yml     #
+# (cùng cluster, service RIÊNG) để so:                                   #
+#   1) thời gian build+push+convert image lên ECR                       #
+#   2) thời gian ECS Fargate task PENDING → STABLE (pull + unpack)       #
+#                                                                         #
+# Vì sao standalone: GitHub-hosted runner không có containerd chạy sẵn,  #
+# mà `soci create`/`soci convert` (mode thường) đều cần containerd. Chỉ  #
+# `soci convert --standalone` mới hoạt động được — convert OCI image     #
+# layout trên đĩa (lấy qua skopeo) mà không cần containerd/sudo daemon.  #
+# Xem docs/cli-usage.md#standalone-mode trong repo awslabs/soci-snapshotter. #
+#                                                                         #
+# Yêu cầu chuẩn bị trước (repo Settings → Secrets and variables → Actions): #
+#   secrets.AWS_ACCESS_KEY_ID     - access key của IAM User (vd tofu)    #
+#   secrets.AWS_SECRET_ACCESS_KEY - secret key tương ứng                 #
+# Yêu cầu hạ tầng: service ECS "ecs-lab-perf-test-soci" trong cluster    #
+# "labtest" phải ĐÃ TỒN TẠI trước (workflow chỉ update-service, không    #
+# tạo service mới — giống 2 workflow legacy/zstd).                       #
+# Yêu cầu: Fargate Platform Version 1.4+ (containerd) để runtime nhận    #
+# diện SOCI-enabled image — xem W:\ecs-research\ecs-fargate-deploy-optimization.html #
+# Lưu ý: IAM User dùng access key dài hạn — chỉ hợp lý cho lab cá nhân,  #
+# KHÔNG khuyến nghị cho production (nên dùng OIDC role-based auth).      #
+#########################################################################
+
+name: "[🧪] LAB - ECS Image Perf Test (SOCI lazy-loading build)"
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY_NAME: lab/lab-ecs
+  ECS_CLUSTER_NAME: labtest
+  ECS_SERVICE_NAME: ecs-lab-perf-test-soci
+  SOCI_VERSION: "0.15.0"
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      IMAGE_URI: ${{ steps.vars.outputs.IMAGE_URI }}
+      LATEST_URI: ${{ steps.vars.outputs.LATEST_URI }}
+      BUILD_PUSH_SECONDS: ${{ steps.build_push.outputs.BUILD_PUSH_SECONDS }}
+      SOCI_CONVERT_SECONDS: ${{ steps.soci_convert.outputs.SOCI_CONVERT_SECONDS }}
+    steps:
+      # Checkout repo so the lab Dockerfile and task definition are available.
+      - name: "📥 Checkout repo"
+        uses: actions/checkout@v4
+
+      # Auth bằng access key của IAM User (lab cá nhân) — không dùng OIDC/role-assumption.
+      - name: "🔐 Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Login to ECR — action này tự docker login (dùng cho bước build base image).
+      - name: "🔑 Login to Amazon ECR"
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # BASE_URI: image gốc gzip (chưa có SOCI index) — tag riêng, chỉ là bước trung gian.
+      # IMAGE_URI: image cuối cùng ĐÃ có SOCI index nhúng sẵn — đây là cái được deploy.
+      # LATEST_URI: con trỏ nổi luôn trỏ tới bản SOCI mới nhất.
+      - name: "🧭 Resolve lab image URI"
+        id: vars
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          echo "BASE_URI=${REGISTRY}/${{ env.ECR_REPOSITORY_NAME }}:lab-soci-base-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_URI=${REGISTRY}/${{ env.ECR_REPOSITORY_NAME }}:lab-soci-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "LATEST_URI=${REGISTRY}/${{ env.ECR_REPOSITORY_NAME }}:lab-soci-latest" >> "$GITHUB_OUTPUT"
+
+      # GitHub-hosted runner có disk nhỏ hơn self-hosted runner nội bộ — image lab ~3.4GB nên
+      # dọn bớt tool cài sẵn (dotnet/android/haskell) để chắc chắn còn đủ chỗ build+push.
+      - name: "🧹 Free up runner disk space"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
+          docker system prune -af || true
+
+      # Build với classic builder (gzip mặc định) — giống hệt arm legacy, để phần "chi phí SOCI
+      # thêm vào" chỉ nằm ở bước convert bên dưới, không lẫn vào khác biệt cách build.
+      - name: "🐳 Build and push base image (legacy builder, gzip) — timed"
+        id: build_push
+        working-directory: ./lab
+        run: |
+          START=$(date +%s)
+
+          DOCKER_BUILDKIT=0 docker build \
+            -f Dockerfile \
+            -t "${{ steps.vars.outputs.BASE_URI }}" \
+            .
+          docker push "${{ steps.vars.outputs.BASE_URI }}"
+
+          END=$(date +%s)
+          echo "BUILD_PUSH_SECONDS=$((END - START))" >> "$GITHUB_OUTPUT"
+          echo "📦 Base build+push duration: $((END - START))s"
+
+      # Cài skopeo (copy image giữa registry ⇄ OCI layout trên đĩa), soci CLI, và oras CLI
+      # (dùng để query OCI Referrers API — xác minh SOCI index có thật sự gắn vào image không).
+      # Cả 3 đều không cần containerd/daemon, phù hợp GitHub-hosted runner.
+      - name: "🛠️ Install skopeo + soci + oras CLI"
+        env:
+          ORAS_VERSION: "1.3.3"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+
+          wget -q "https://github.com/awslabs/soci-snapshotter/releases/download/v${{ env.SOCI_VERSION }}/soci-snapshotter-${{ env.SOCI_VERSION }}-linux-amd64.tar.gz"
+          sudo tar -C /usr/local/bin -xzf "soci-snapshotter-${{ env.SOCI_VERSION }}-linux-amd64.tar.gz" soci
+          soci --version
+
+          wget -q "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          sudo tar -C /usr/local/bin -xzf "oras_${ORAS_VERSION}_linux_amd64.tar.gz" oras
+          oras version
+
+      # skopeo/oras không dùng chung credential helper mà docker login tạo ra, nên login riêng
+      # bằng chính ECR token đã lấy được ở bước trên.
+      - name: "🔑 Login skopeo + oras to Amazon ECR"
+        run: |
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | \
+            skopeo login --username AWS --password-stdin "${{ steps.login-ecr.outputs.registry }}"
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | \
+            oras login --username AWS --password-stdin "${{ steps.login-ecr.outputs.registry }}"
+
+      # Bước cốt lõi của arm này: kéo base image xuống dạng OCI layout (skopeo), convert sang
+      # SOCI Index Manifest v2 bằng --standalone (không cần containerd), rồi đẩy image đã có
+      # SOCI index lên ECR với tag riêng. Layer ảnh hưởng dùng chung với base image (soci convert
+      # chỉ thêm vài KB metadata), nên phần thời gian đo ở đây chính là "chi phí SOCI thêm vào
+      # pipeline" so với 2 arm kia.
+      - name: "🧬 Convert to SOCI-enabled image (standalone) — timed"
+        id: soci_convert
+        run: |
+          START=$(date +%s)
+
+          skopeo copy "docker://${{ steps.vars.outputs.BASE_URI }}" oci-archive:base.tar
+          soci convert --standalone base.tar soci.tar
+          skopeo copy --all oci-archive:soci.tar "docker://${{ steps.vars.outputs.IMAGE_URI }}"
+          skopeo copy --all oci-archive:soci.tar "docker://${{ steps.vars.outputs.LATEST_URI }}"
+
+          END=$(date +%s)
+          echo "SOCI_CONVERT_SECONDS=$((END - START))" >> "$GITHUB_OUTPUT"
+          echo "🧬 SOCI convert+push duration: $((END - START))s"
+
+      # Dọn file tạm + local image để giải phóng disk runner.
+      - name: "🧹 Clean up local files"
+        if: always()
+        run: |
+          rm -f base.tar soci.tar
+          docker rmi "${{ steps.vars.outputs.BASE_URI }}" || true
+
+      # Report the compressed size actually stored in ECR — so sánh với size của legacy/zstd.
+      # SOCI-enabled image chia sẻ layer với base nên size KHÔNG tăng đáng kể — chỉ thêm ít KB
+      # metadata index, khác với zstd (giảm size do đổi thuật toán nén).
+      - name: "📏 Report image size in ECR"
+        run: |
+          aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPOSITORY_NAME }}" \
+            --image-ids imageTag="lab-soci-${{ github.run_number }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'imageDetails[0].imageSizeInBytes' \
+            --no-cli-pager
+
+      # Đọc thẳng manifest trên registry — cho biết media type của manifest cuối cùng (image
+      # SOCI-enabled là 1 manifest đóng gói, khác cấu trúc layer đơn giản của legacy/zstd).
+      - name: "🖼️ Inspect final manifest (SOCI-enabled image)"
+        run: |
+          skopeo inspect --raw "docker://${{ steps.vars.outputs.IMAGE_URI }}" > manifest.json
+          MEDIA_TYPE=$(jq -r '.mediaType' manifest.json)
+
+          {
+            echo ""
+            echo "### 🖼️ Manifest — SOCI-enabled image"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Manifest media type | \`$MEDIA_TYPE\` |"
+            echo "| Base image (không có SOCI index) | \`${{ steps.vars.outputs.BASE_URI }}\` |"
+            echo "| SOCI-enabled image (deploy bằng cái này) | \`${{ steps.vars.outputs.IMAGE_URI }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ECS/Fargate KHÔNG có API public nào trả về "task này đã lazy-load qua SOCI: có/không" —
+      # bằng chứng client-side mạnh nhất có thể lấy được là: index có thật sự tồn tại và gắn
+      # đúng digest image này trong registry hay không (artifactType lấy từ chính source code
+      # awslabs/soci-snapshotter: application/vnd.amazon.soci.index.v1+json hoặc v2).
+      # oras discover = client chuẩn để query OCI Referrers API (RFC: OCI Distribution Spec v1.1).
+      - name: "🔎 Verify SOCI index is attached (OCI Referrers API)"
+        run: |
+          echo "--- oras discover raw output ---"
+          REFERRERS_RAW=$(oras discover "${{ steps.vars.outputs.IMAGE_URI }}" --format json 2>&1) || true
+          echo "$REFERRERS_RAW"
+
+          if echo "$REFERRERS_RAW" | grep -qi "soci.index"; then
+            FOUND="yes"
+          else
+            FOUND="no"
+          fi
+
+          {
+            echo ""
+            echo "### 🔎 SOCI index verification — bằng chứng gián tiếp, không phải xác nhận runtime"
+            echo ""
+            if [ "$FOUND" = "yes" ]; then
+              echo "✅ **Tìm thấy SOCI index artifact (\`soci.index.v1/v2\`) gắn với image này qua OCI Referrers API.**"
+              echo "→ Precondition để Fargate lazy-load đã được thoả — Fargate CÓ index để dùng khi task này chạy."
+            else
+              echo "⚠️ Không thấy referrer \`soci.index\` qua \`oras discover\`. Có thể do: ECR chưa expose Referrers API"
+              echo "công khai ở thời điểm chạy, soci convert đóng gói theo kiểu khác (manifest list thay vì referrer"
+              echo "riêng), hoặc registry cache. **Không kết luận SOCI không hoạt động chỉ từ dòng này** — vẫn phải"
+              echo "đối chiếu Pull duration bên dưới với arm legacy (cùng base image amazoncorretto)."
+            fi
+            echo ""
+            echo "_AWS không cung cấp API nào xác nhận trực tiếp \"task đã lazy-load qua SOCI\" phía client — 2 tín hiệu"
+            echo "khả dụng là: (1) index có tồn tại đúng digest hay không (ở trên), và (2) Pull start→stop trong mục"
+            echo "\"ECS task timeline breakdown\" của Deploy job — so với Pull duration của arm legacy (cùng base"
+            echo "image, KHÔNG có SOCI) để suy luận. Với base image nhỏ (~158MB hiện tại), chênh lệch có thể không"
+            echo "rõ rệt — SOCI phát huy tác dụng rõ nhất với image lớn (khuyến nghị AWS: >250MB)._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  Deploy:
+    needs: [Build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Checkout repo because the task definition is stored here.
+      - name: "📥 Checkout repo"
+        uses: actions/checkout@v4
+
+      # Auth bằng access key của IAM User — mỗi job chạy trên runner riêng nên phải cấu hình lại.
+      - name: "🔐 Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Update task definition JSON so ECS deploys the SOCI-enabled image (không phải base image).
+      - name: "🧩 Update task definition image"
+        working-directory: ./ecs
+        run: |
+          echo "Current Task Definition"
+          cat "ecs-lab-perf-test-soci.json"
+
+          jq --arg IMAGE "${{ needs.Build.outputs.IMAGE_URI }}" \
+             --arg NAME "ecs-lab-perf-test-soci" \
+          '.containerDefinitions |= map(
+            if .name == $NAME
+            then .image = $IMAGE
+            else .
+            end
+          )' "ecs-lab-perf-test-soci.json" > new-task-def.json
+
+          echo "New Task Definition"
+          cat new-task-def.json
+
+      # Register the updated task definition and expose ARN to later steps.
+      - name: "📝 Register new task definition"
+        working-directory: ./ecs
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --region "${{ env.AWS_REGION }}" \
+            --output text \
+            --no-cli-pager)
+
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> "$GITHUB_ENV"
+          echo "$TASK_DEF_ARN"
+
+      # Deploy + wait, timed as ONE block — same methodology as legacy/zstd, so all 3 số đo được
+      # so sánh trực tiếp. platform-version pinned to 1.4+ (required for SOCI, cần containerd).
+      - name: "🚀 Deploy ECS service and measure time-to-stable"
+        run: |
+          START=$(date +%s)
+
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --service "${{ env.ECS_SERVICE_NAME }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --task-definition "$TASK_DEF_ARN" \
+            --desired-count 1 \
+            --platform-version "1.4.0" \
+            --no-cli-pager
+
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --service "${{ env.ECS_SERVICE_NAME }}" \
+            --no-cli-pager
+
+          END=$(date +%s)
+          echo "DEPLOY_STABLE_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+          echo "⏱️ Time to stable: $((END - START))s"
+
+      # aws ecs wait chỉ poll mỗi 15s (nhiễu ±15s) và đo CẢ rollout/drain task cũ, không chỉ pull.
+      # Timestamp dưới đây do chính ECS agent ghi lại — tách riêng đúng giai đoạn pull+unpack,
+      # là con số tương ứng trực tiếp với benchmark legacy/zstd (không lẫn overhead khác).
+      # Với SOCI, "pull" ở đây thực chất là lazy-load nên kỳ vọng ngắn hơn — container có thể
+      # START trước khi toàn bộ layer được kéo về xong.
+      - name: "📊 Fetch ECS task timeline breakdown"
+        run: |
+          TASK_ARN=$(aws ecs list-tasks \
+            --region "${{ env.AWS_REGION }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --service-name "${{ env.ECS_SERVICE_NAME }}" \
+            --query 'taskArns[0]' --output text)
+
+          read -r CREATED CONN PULL_START PULL_STOP STARTED <<< "$(aws ecs describe-tasks \
+            --region "${{ env.AWS_REGION }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].[createdAt,connectivityAt,pullStartedAt,pullStoppedAt,startedAt]' \
+            --output text)"
+
+          to_epoch() { date -d "$1" +%s.%N; }
+
+          T_CREATED=$(to_epoch "$CREATED")
+          T_CONN=$(to_epoch "$CONN")
+          T_PULL_START=$(to_epoch "$PULL_START")
+          T_PULL_STOP=$(to_epoch "$PULL_STOP")
+          T_STARTED=$(to_epoch "$STARTED")
+
+          NETWORK_SETUP=$(awk "BEGIN {printf \"%.1f\", $T_CONN - $T_CREATED}")
+          AGENT_INIT=$(awk "BEGIN {printf \"%.1f\", $T_PULL_START - $T_CONN}")
+          PULL_DURATION=$(awk "BEGIN {printf \"%.1f\", $T_PULL_STOP - $T_PULL_START}")
+          CONTAINER_INIT=$(awk "BEGIN {printf \"%.1f\", $T_STARTED - $T_PULL_STOP}")
+          TOTAL_LAUNCH=$(awk "BEGIN {printf \"%.1f\", $T_STARTED - $T_CREATED}")
+
+          echo "PULL_DURATION_SECONDS=$PULL_DURATION" >> "$GITHUB_ENV"
+          echo "TOTAL_LAUNCH_SECONDS=$TOTAL_LAUNCH" >> "$GITHUB_ENV"
+
+          {
+            echo ""
+            echo "### ⏱️ ECS task timeline breakdown — SOCI lazy-loading build"
+            echo "_(timestamp từ ECS agent, không qua wait-polling)_"
+            echo ""
+            echo "| Giai đoạn | Thời gian |"
+            echo "| --- | --- |"
+            echo "| Created → Connectivity (ENI attach) | ${NETWORK_SETUP}s |"
+            echo "| Connectivity → Pull start (agent init) | ${AGENT_INIT}s |"
+            echo "| **Pull start → Pull stop (lazy-load qua SOCI)** | **${PULL_DURATION}s** |"
+            echo "| Pull stop → Started (container init) | ${CONTAINER_INIT}s |"
+            echo "| **Tổng Created → Started (task launch thật)** | **${TOTAL_LAUNCH}s** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Write a step summary so this run is easy to compare against the legacy/zstd lab runs.
+      - name: "🧾 Report lab result"
+        run: |
+          {
+            echo ""
+            echo "### 🧪 Lab result — SOCI lazy-loading build"
+            echo ""
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            echo "| Image URI (tag theo run, bất biến) | \`${{ needs.Build.outputs.IMAGE_URI }}\` |"
+            echo "| Latest tag (con trỏ nổi) | \`${{ needs.Build.outputs.LATEST_URI }}\` |"
+            echo "| Base build+push duration (gzip, giống arm legacy) | ${{ needs.Build.outputs.BUILD_PUSH_SECONDS }}s |"
+            echo "| SOCI convert+push duration (chi phí thêm riêng của arm này) | ${{ needs.Build.outputs.SOCI_CONVERT_SECONDS }}s |"
+            echo "| Deploy → stable duration (wall-clock, gồm rollout+drain+polling) | ${DEPLOY_STABLE_SECONDS}s |"
+            echo "| Pull start → stop duration (chuẩn, từ ECS agent) | ${PULL_DURATION_SECONDS}s |"
+            echo "| Task launch total (Created → Started) | ${TOTAL_LAUNCH_SECONDS}s |"
+          } >> "$GITHUB_STEP_SUMMARY"
