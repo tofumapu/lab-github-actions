@@ -42,7 +42,7 @@ env:
 jobs:
   Build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     outputs:
       IMAGE_URI: ${{ steps.vars.outputs.IMAGE_URI }}
       LATEST_URI: ${{ steps.vars.outputs.LATEST_URI }}
@@ -157,13 +157,20 @@ jobs:
       # SOCI index lên ECR với tag riêng. Layer ảnh hưởng dùng chung với base image (soci convert
       # chỉ thêm vài KB metadata), nên phần thời gian đo ở đây chính là "chi phí SOCI thêm vào
       # pipeline" so với 2 arm kia.
+      # Mỗi bước có log mốc thời gian riêng — với image vài GB, `soci convert` (CPU-bound) và
+      # `skopeo copy` (network-bound) có thể mất vài phút KHÔNG in thêm dòng log nào, dễ nhìn
+      # nhầm là bị treo. Có mốc rõ ràng để biết đang ở bước nào trước khi quyết định cancel.
       - name: "🧬 Convert to SOCI-enabled image (standalone) — timed"
         id: soci_convert
         run: |
           START=$(date +%s)
 
+          echo "▶️ [1/4] $(date +%T) skopeo copy base image → OCI archive (network)"
           skopeo copy "docker://${{ steps.vars.outputs.BASE_URI }}" oci-archive:base.tar
+
+          echo "▶️ [2/4] $(date +%T) soci convert --standalone (CPU-bound — image càng to càng lâu, có thể vài phút, KHÔNG in log giữa chừng)"
           soci convert --standalone base.tar soci.tar
+          echo "✅ [2/4] $(date +%T) soci convert xong"
 
           # Đỉnh disk của cả job nằm ở đây (base.tar + soci.tar tồn tại song song) — log ra để
           # dễ debug nếu job fail vì hết disk trên image lớn.
@@ -171,8 +178,30 @@ jobs:
           df -h / || true
           ls -lh base.tar soci.tar || true
 
+          echo "▶️ [3/4] $(date +%T) Push SOCI-enabled image lên ECR (tag theo run, network — chậm nhất với image to)"
           skopeo copy --all oci-archive:soci.tar "docker://${{ steps.vars.outputs.IMAGE_URI }}"
-          skopeo copy --all oci-archive:soci.tar "docker://${{ steps.vars.outputs.LATEST_URI }}"
+          echo "✅ [3/4] $(date +%T) Push tag chính xong"
+
+          # Gắn tag "-latest" bằng aws ecr put-image thay vì skopeo copy --all lần 2 — chỉ đăng
+          # ký lại đúng manifest đã push ở bước [3/4] dưới 1 tag mới, KHÔNG upload lại byte nào
+          # (mọi blob đã tồn tại trong ECR), nên gần như tức thì thay vì phải đợi push lại cả image.
+          echo "▶️ [4/4] $(date +%T) Gắn tag lab-soci-latest qua aws ecr put-image (retag, không upload lại)"
+          MANIFEST=$(aws ecr batch-get-image \
+            --region "${{ env.AWS_REGION }}" \
+            --repository-name "${{ env.ECR_REPOSITORY_NAME }}" \
+            --image-ids imageTag="lab-soci-${{ github.run_number }}" \
+            --accepted-media-types \
+              application/vnd.oci.image.manifest.v1+json \
+              application/vnd.oci.image.index.v1+json \
+              application/vnd.docker.distribution.manifest.v2+json \
+              application/vnd.docker.distribution.manifest.list.v2+json \
+            --query 'images[0].imageManifest' --output text)
+          aws ecr put-image \
+            --region "${{ env.AWS_REGION }}" \
+            --repository-name "${{ env.ECR_REPOSITORY_NAME }}" \
+            --image-tag "lab-soci-latest" \
+            --image-manifest "$MANIFEST" >/dev/null
+          echo "✅ [4/4] $(date +%T) Retag xong"
 
           END=$(date +%s)
           echo "SOCI_CONVERT_SECONDS=$((END - START))" >> "$GITHUB_OUTPUT"
