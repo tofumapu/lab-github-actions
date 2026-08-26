@@ -148,6 +148,21 @@ jobs:
           echo "SOCI_CONVERT_SECONDS=$((END - START))" >> "$GITHUB_OUTPUT"
           echo "🧬 SOCI convert+push duration: $((END - START))s"
 
+      # Base image chỉ là bước trung gian để feed vào soci convert — hết tác dụng ngay khi
+      # image cuối (đã có SOCI index) push xong. Không xoá thì mỗi lần chạy tốn 2 slot trong
+      # lifecycle policy "giữ 10 image lab-soci*" (base + final cùng prefix), khiến giới hạn
+      # thực tế chỉ còn ~5 lần chạy thay vì 10 như 2 arm kia. batch-delete-image xoá tag DUY
+      # NHẤT trên digest này → ECR xoá luôn cả image, không để lại rác "untagged" nào.
+      # if: always() để dọn cả khi convert phía trên lỡ fail giữa chừng.
+      - name: "🧹 Delete intermediate base tag from ECR"
+        if: always()
+        run: |
+          aws ecr batch-delete-image \
+            --region "${{ env.AWS_REGION }}" \
+            --repository-name "${{ env.ECR_REPOSITORY_NAME }}" \
+            --image-ids imageTag="lab-soci-base-${{ github.run_number }}" \
+            --query 'imageIds' --output table || true
+
       # Dọn file tạm + local image để giải phóng disk runner.
       - name: "🧹 Clean up local files"
         if: always()
