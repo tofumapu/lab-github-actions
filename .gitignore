@@ -1,2 +1,8 @@
-node_modules/
-coverage/
+# local artifacts produced by running the lab workflows outside CI
+*.tar
+manifest.json
+new-task-def.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

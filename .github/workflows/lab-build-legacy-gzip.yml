@@ -12,7 +12,7 @@
 # `env:` bên dưới — sửa trực tiếp trong file này nếu đổi tài nguyên lab. #
 # Lưu ý: IAM User dùng access key dài hạn — chỉ hợp lý cho lab cá nhân,  #
 # KHÔNG khuyến nghị cho production (nên dùng OIDC role-based auth).      #
-# Xem thêm: W:\ecs-research\ecs-fargate-deploy-optimization.html         #
+# Xem thêm: slide deck zstd + SOCI (giữ local, không nằm trong repo này) #
 #########################################################################
 
 name: "[🧪] LAB - ECS Image Perf Test (Legacy gzip build)"
@@ -73,7 +73,7 @@ jobs:
       # image exporter fuses build+compress+push into a single step and cannot be split the same way.
       - name: "🐳 Build and push image (legacy builder, gzip) — timed"
         id: build_push
-        working-directory: ./lab
+        working-directory: ./ecs-research/lab
         run: |
           START=$(date +%s)
 
@@ -88,7 +88,7 @@ jobs:
           echo "📦 Build+push duration: $((END - START))s"
 
       # Tag + push thêm "-latest" trỏ tới digest vừa build — chung digest với tag số nên
-      # ECR lifecycle policy (xem ecr/lifecycle-policy.json) không tính đây là image thứ 2.
+      # ECR lifecycle policy (xem ecs-research/ecr/lifecycle-policy.json) không tính đây là image thứ 2.
       - name: "🏷️ Tag as lab-legacy-latest"
         run: |
           docker tag "${{ steps.vars.outputs.IMAGE_URI }}" "${{ steps.vars.outputs.LATEST_URI }}"
@@ -157,7 +157,7 @@ jobs:
 
       # Update task definition JSON so ECS deploys the newly pushed lab image.
       - name: "🧩 Update task definition image"
-        working-directory: ./ecs
+        working-directory: ./ecs-research/ecs
         run: |
           echo "Current Task Definition"
           cat "ecs-lab-perf-test-legacy.json"
@@ -176,7 +176,7 @@ jobs:
 
       # Register the updated task definition and expose ARN to later steps.
       - name: "📝 Register new task definition"
-        working-directory: ./ecs
+        working-directory: ./ecs-research/ecs
         run: |
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://new-task-def.json \

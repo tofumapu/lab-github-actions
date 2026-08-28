@@ -11,7 +11,7 @@
 # Các giá trị môi trường khác (region, ECR/ECS name) đã set cứng ở khối  #
 # `env:` bên dưới — sửa trực tiếp trong file này nếu đổi tài nguyên lab. #
 # Yêu cầu: Fargate Platform Version 1.4+ (containerd) để runtime nhận    #
-# diện layer zstd — xem W:\ecs-research\ecs-fargate-deploy-optimization.html #
+# diện layer zstd — xem slide deck zstd + SOCI (giữ local, không nằm trong repo) #
 # Lưu ý: IAM User dùng access key dài hạn — chỉ hợp lý cho lab cá nhân,  #
 # KHÔNG khuyến nghị cho production (nên dùng OIDC role-based auth).      #
 #########################################################################
@@ -80,7 +80,7 @@ jobs:
       # provenance/sbom disabled to keep the comparison focused on layer compression only.
       - name: "🐳 Build and push image (buildx, zstd compression) — timed"
         id: build_push
-        working-directory: ./lab
+        working-directory: ./ecs-research/lab
         run: |
           START=$(date +%s)
 
@@ -153,7 +153,7 @@ jobs:
 
       # Update task definition JSON so ECS deploys the newly pushed lab image.
       - name: "🧩 Update task definition image"
-        working-directory: ./ecs
+        working-directory: ./ecs-research/ecs
         run: |
           echo "Current Task Definition"
           cat "ecs-lab-perf-test-zstd.json"
@@ -172,7 +172,7 @@ jobs:
 
       # Register the updated task definition and expose ARN to later steps.
       - name: "📝 Register new task definition"
-        working-directory: ./ecs
+        working-directory: ./ecs-research/ecs
         run: |
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://new-task-def.json \
