@@ -1,13 +1,13 @@
 # Lab image dùng riêng để benchmark hiệu năng push/pull image ECS — KHÔNG chạy workload thật.
-# nvidia/cuda:12.4.1-cudnn-devel ~4.45 GB nén (đã verify qua docker buildx imagetools inspect)
-# — quay lại image to sau khi test với amazoncorretto (~158MB) cho thấy chênh lệch gzip/zstd/SOCI
-# gần như không đáng kể ở size nhỏ. CUDA toolkit + cuDNN devel gồm rất nhiều file nhị phân/thư
-# viện lớn, tải công khai được từ Docker Hub, không cần đăng nhập NGC.
+# amazoncorretto:21-al2023 ~215MB nén (2 layer, verify qua docker manifest inspect) — base JRE
+# thật của các service Java trong production, thay cho nvidia/cuda:12.4.1-cudnn-devel (~4.45GB)
+# dùng tạm trước đó chỉ để thấy rõ chênh lệch gzip/zstd/SOCI ở size lớn. Dùng lại al2023 (glibc,
+# gần với môi trường prod thật) thay vì biến thể -alpine đã test trước đây.
 #
 # Nội dung image không quan trọng — cái cần đo là: kích thước sau nén (gzip vs zstd) và
 # thời gian ECS Fargate task PENDING (pull + unpack, hoặc lazy-load qua SOCI) cho tới khi
-# service ổn định — image to hơn giúp thấy rõ khác biệt cả 3 arm hơn nhiều.
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# service ổn định.
+FROM amazoncorretto:21-al2023
 
 # Không có app thật nên giữ container sống bằng sleep — đủ để ECS coi task là RUNNING/STABLE.
 CMD ["sleep", "infinity"]
